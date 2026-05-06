@@ -48,6 +48,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
+from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
+from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
@@ -324,6 +327,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_ba",
         )
+        self.disable_tp_for_ba_proj = self.maybe_disable_tp(quant_config)
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -431,46 +435,33 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         output_sizes = (
             [num_v_heads * 2] if self.gqa_interleaved_layout else [num_v_heads] * 2
         )
-
-        # Marlin requires output_size_per_partition >= MIN_THREAD_N=64. With
-        # small num_v_heads at TP>=2, ba_proj falls below this (e.g. Qwen3.5
-        # 397B: num_v_heads=64, TP=4 -> 16 per rank, fails). Disable TP for
-        # ba_proj only when a Marlin-backed quant config is in use, so each
-        # rank computes the full projection. The forward path slices to the
-        # local TP partition. Other quant schemes (FP8, unquantized) keep
-        # normal TP sharding. See PR #36329 / issue #35924.
-        disable_tp = self._ba_proj_should_disable_tp(quant_config)
-        self._ba_proj_disable_tp = disable_tp
-
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=output_sizes,
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
-            disable_tp=disable_tp,
+            disable_tp=self.maybe_disable_tp(quant_config),
         )
 
-    @staticmethod
-    def _ba_proj_should_disable_tp(
-        quant_config: QuantizationConfig | None,
-    ) -> bool:
-        """Return True if ba_proj must be replicated to satisfy Marlin's
-        MIN_THREAD_N=64 constraint at TP>=2."""
-        if quant_config is None:
-            return False
-        # Lazy imports to avoid circular deps and to keep this layer
-        # decoupled from quant backends.
-        try:
-            from vllm.model_executor.layers.quantization.awq_marlin import (
-                AWQMarlinConfig,
-            )
-            from vllm.model_executor.layers.quantization.gptq_marlin import (
-                GPTQMarlinConfig,
-            )
-        except ImportError:
-            return False
-        return isinstance(quant_config, (GPTQMarlinConfig, AWQMarlinConfig))
+    def maybe_disable_tp(self, quant_config: QuantizationConfig | None) -> bool:
+        """Determine whether to disable TP for ba_proj based on quant config."""
+        # Marlin requires output_size_per_partition >= MIN_THREAD_N=64,
+        # while large TP size can hit the corner case.
+        # See https://github.com/vllm-project/vllm/issues/35924
+        return current_platform.is_cuda() and isinstance(
+            quant_config, (AWQMarlinConfig, GPTQMarlinConfig, INCConfig)
+        )
+
+    def split_ba(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        b, a = ba.chunk(2, dim=-1)
+        if self.disable_tp_for_ba_proj and self.tp_size > 1:
+            # ba_proj is replicated for Marlin; slice to local TP rank.
+            ba_chunk = self.num_v_heads // self.tp_size
+            ba_start = self.tp_rank * ba_chunk
+            b = b[:, ba_start : ba_start + ba_chunk]
+            a = a[:, ba_start : ba_start + ba_chunk]
+        return b, a
 
     def fix_query_key_value_ordering(
         self,
@@ -570,13 +561,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = ba.chunk(2, dim=-1)
-            if getattr(self, "_ba_proj_disable_tp", False) and self.tp_size > 1:
-                # ba_proj is replicated for Marlin; slice to local TP rank.
-                ba_chunk = self.num_v_heads // self.tp_size
-                ba_start = self.tp_rank * ba_chunk
-                b = b[:, ba_start:ba_start + ba_chunk]
-                a = a[:, ba_start:ba_start + ba_chunk]
+            b, a = self.split_ba(ba)
             b = b.contiguous()
             a = a.contiguous()
         else:
@@ -598,16 +583,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 z_size = self.value_dim // self.tp_size
                 mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = ba.chunk(2, dim=-1)
-                if (
-                    getattr(self, "_ba_proj_disable_tp", False)
-                    and self.tp_size > 1
-                ):
-                    # ba_proj is replicated for Marlin; slice to local TP rank.
-                    ba_chunk = self.num_v_heads // self.tp_size
-                    ba_start = self.tp_rank * ba_chunk
-                    b = b[:, ba_start:ba_start + ba_chunk]
-                    a = a[:, ba_start:ba_start + ba_chunk]
+                b, a = self.split_ba(ba)
                 b = b.contiguous()
                 a = a.contiguous()
 
@@ -662,17 +638,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
-        if getattr(self, "_ba_proj_disable_tp", False) and self.tp_size > 1:
-            # ba_proj is replicated for Marlin; slice to local TP rank
-            # so the XPU kernel receives the expected per-rank shape.
-            num_v = self.num_v_heads
-            chunk = num_v // self.tp_size
-            start = self.tp_rank * chunk
-            b_full, a_full = projected_states_ba.chunk(2, dim=-1)
-            projected_states_ba = torch.cat(
-                [b_full[:, start:start + chunk], a_full[:, start:start + chunk]],
-                dim=-1,
-            ).contiguous()
 
         # ============================================================
         # Part 2: Core Attention
